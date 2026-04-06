@@ -120,8 +120,6 @@ def main():
         run_gui()
 
     else:
-        # When no command is specified, run the server by default
-        print("MCP server started!")
         run_server()
 
 if __name__ == "__main__":

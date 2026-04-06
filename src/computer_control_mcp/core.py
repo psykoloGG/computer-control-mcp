@@ -39,7 +39,42 @@ from pydantic import BaseModel
 
 BaseModel.model_config = {"arbitrary_types_allowed": True}
 
-engine = RapidOCR()
+
+def _configure_standard_streams() -> None:
+    """Force UTF-8 stdio so MCP JSON and logs do not fail on Unicode."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+def _sanitize_for_stream(message: str, stream) -> str:
+    """Convert text to something the target stream can always print."""
+    text = str(message)
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    return text.encode(encoding, errors="replace").decode(
+        encoding, errors="replace"
+    )
+
+
+def _write_log_line(stream, prefix: str, message: str) -> None:
+    """Write a log line without letting console encoding crash the server."""
+    text = _sanitize_for_stream(f"{prefix}{message}", stream)
+    if hasattr(stream, "buffer"):
+        stream.buffer.write((text + "\n").encode("utf-8", errors="replace"))
+        stream.buffer.flush()
+        return
+
+    stream.write(text + "\n")
+    stream.flush()
+
+
+_configure_standard_streams()
+
+engine = None
 
 
 DEBUG = True  # Set to False in production
@@ -62,37 +97,23 @@ IS_DEVELOPMENT = os.getenv("ENV") == "development"
 
 
 def log(message: str) -> None:
-    """Log to stderr in dev, to stdout or file in production.
-    
-    Handles Unicode encoding errors gracefully to prevent crashes
-    when printing special characters on Windows terminals.
-    """
+    """Write package logs to stderr so stdio MCP transport stays clean."""
+    prefix = "[DEV] " if IS_DEVELOPMENT else "[PROD] "
     try:
-        if IS_DEVELOPMENT:
-            # In dev, write to stderr
-            print(f"[DEV] {message}", file=sys.stderr)
-        else:
-            # In production, write to stdout or a file
-            print(f"[PROD] {message}", file=sys.stdout)
-            # or append to a file: open("app.log", "a").write(message+"\n")
-    except UnicodeEncodeError:
-        # Handle encoding errors by escaping or replacing problematic characters
-        safe_message = message.encode('utf-8', errors='replace').decode('utf-8')
-        if IS_DEVELOPMENT:
-            print(f"[DEV] {safe_message}", file=sys.stderr)
-        else:
-            print(f"[PROD] {safe_message}", file=sys.stdout)
+        _write_log_line(sys.stderr, prefix, message)
     except Exception:
-        # Fallback for any other printing errors
         try:
-            safe_message = repr(message)  # Use repr to escape special characters
-            if IS_DEVELOPMENT:
-                print(f"[DEV] {safe_message}", file=sys.stderr)
-            else:
-                print(f"[PROD] {safe_message}", file=sys.stdout)
+            _write_log_line(sys.stderr, prefix, repr(message))
         except Exception:
-            # Last resort - if even repr fails, don't crash
             pass
+
+
+def _get_ocr_engine():
+    """Create the OCR engine only when OCR is actually used."""
+    global engine
+    if engine is None:
+        engine = RapidOCR()
+    return engine
 
 
 def get_downloads_dir() -> Path:
@@ -455,7 +476,7 @@ def take_screenshot(
                 time.sleep(0.3)  # wait for OS to update
 
             except Exception as e:
-                print(f"Warning: Could not force window: {e}", file=sys.stderr)
+                log(f"Warning: Could not force window: {e}")
 
         # Take the screenshot
         if not window:
@@ -580,27 +601,13 @@ def _safe_format_ocr_results(results: List[Tuple]) -> str:
         Safely formatted string representation of the results
     """
     try:
-        # Try normal formatting first
-        return str(results)
-    except UnicodeEncodeError:
-        # If that fails, create a safe representation
         safe_items = []
         for item in results:
-            # Handle each component of the tuple
             boxes, text, confidence = item
-            # Ensure text is safe for printing
-            try:
-                safe_text = str(text)
-                safe_text.encode('utf-8').decode(sys.stdout.encoding or 'utf-8')
-            except (UnicodeEncodeError, UnicodeDecodeError):
-                # Replace problematic characters
-                safe_text = text.encode('utf-8', errors='replace').decode('utf-8')
-            
+            safe_text = _sanitize_for_stream(text, sys.stdout)
             safe_items.append((boxes, safe_text, confidence))
-        
         return str(safe_items)
     except Exception:
-        # Ultimate fallback
         return f"<OCR results with {len(results)} items>"
 
 
@@ -718,7 +725,7 @@ def take_screenshot_with_ocr(
         # save resized image to pwd
         # cv2.imwrite("resized_img.png", resized_img)
 
-        output = engine(resized_img)
+        output = _get_ocr_engine()(resized_img)
         boxes = output.boxes
         txts = output.txts
         scores = output.scores
